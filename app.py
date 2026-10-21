@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urldefrag, quote
 from urllib.robotparser import RobotFileParser
 import socket
+import threading
 
 import pandas as pd
 import requests
@@ -61,27 +62,58 @@ def public_url(url, domain=None):
         return False
 
 
+# Each worker owns its diagnostic records; crawling decisions remain unchanged.
+_diag_local = threading.local()
+
+def log_request(url, status, detail='', elapsed=0.0):
+    records = getattr(_diag_local, 'records', None)
+    if records is not None:
+        records.append({'ドメイン': getattr(_diag_local, 'domain', ''),
+                        '取得URL': url, 'HTTPステータス': status,
+                        '詳細': str(detail)[:300], '所要秒': round(elapsed, 2)})
+
 def safe_get(url, domain, session):
-    if not public_url(url, domain): return None
+    start = time.monotonic()
+    if not public_url(url, domain):
+        log_request(url, 'URL検証不可', '公開URLとして検証できないかDNS解決に失敗', time.monotonic()-start)
+        return None
     try:
         r = session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False, stream=True)
         if r.status_code in (301, 302, 303, 307, 308):
             location = r.headers.get('Location')
             r.close()
-            if not location: return None
+            if not location:
+                log_request(url, r.status_code, 'Locationヘッダーなし', time.monotonic()-start)
+                return None
             target = urljoin(url, location)
-            if not public_url(target, domain): return None
+            if not public_url(target, domain):
+                log_request(url, r.status_code, 'リダイレクト先が許可範囲外または検証不可', time.monotonic()-start)
+                return None
             r = session.get(target, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False, stream=True)
-        if r.status_code != 200: r.close(); return None
+        if r.status_code != 200:
+            log_request(url, r.status_code, 'HTTPエラー', time.monotonic()-start)
+            r.close()
+            return None
         typ = r.headers.get('Content-Type', '').lower()
-        if not any(t in typ for t in ('html', 'xml', 'text/plain')): r.close(); return None
+        if not any(t in typ for t in ('html', 'xml', 'text/plain')):
+            log_request(url, 200, '対象外Content-Type: '+typ, time.monotonic()-start)
+            r.close()
+            return None
         raw = bytearray()
         for chunk in r.iter_content(65536):
             raw.extend(chunk)
-            if len(raw) > MAX_BYTES: r.close(); return None
+            if len(raw) > MAX_BYTES:
+                log_request(url, 200, 'サイズ上限超過', time.monotonic()-start)
+                r.close()
+                return None
         r._content = bytes(raw)
+        log_request(url, 200, '取得成功', time.monotonic()-start)
         return r
-    except requests.RequestException:
+    except requests.Timeout as exc:
+        log_request(url, 'タイムアウト', type(exc).__name__, time.monotonic()-start)
+        return None
+    except requests.RequestException as exc:
+        log_request(url, '通信エラー', type(exc).__name__+': '+str(exc), time.monotonic()-start)
         return None
 
 
@@ -182,10 +214,10 @@ def read_urls(upload):
     return pd.read_excel(upload, dtype=str)
 
 
-def excel_bytes(details, summary, errors, history):
+def excel_bytes(details, summary, errors, history, diagnostics):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine='openpyxl') as writer:
-        for name, frame in [('掲載URL一覧', details), ('ドメイン別集計', summary), ('エラー一覧', errors), ('検索履歴', history)]:
+        for name, frame in [('掲載URL一覧', details), ('ドメイン別集計', summary), ('エラー一覧', errors), ('検索履歴', history), ('取得診断', diagnostics)]:
             frame.to_excel(writer, sheet_name=name, index=False)
             ws = writer.sheets[name]
             ws.freeze_panes = 'A2'
@@ -257,6 +289,8 @@ if raw_urls:
 
 def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_urls):
     details, errors = [], []
+    _diag_local.records = []
+    _diag_local.domain = domain
     site_name = ''
     now = datetime.now(timezone.utc).isoformat(timespec='seconds')
     visited, checked, succeeded = set(), 0, 0
@@ -313,11 +347,13 @@ def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_ur
         session.close()
     history = {'サイト名': site_name, 'ドメイン': domain, '設定ID': settings_id, '状態': state,
                '確認ページ数': checked, '取得成功ページ数': succeeded, '候補URL数': len(locals().get('frontier', [])) + len(visited), '検出URL数': len(details), '確認日時UTC': now}
-    return details, errors, history
+    records = _diag_local.records
+    _diag_local.records = None
+    return details, errors, history, records
 
 
 st.caption('ドメイン間は並列処理。入力URLを優先し、続いてサイトマップ・サイト内リンクを確認します。')
-workers = 3  # 検証用：同時処理ドメイン数を3に固定（UIには表示しない）
+workers = 5  # 同時処理ドメイン数（UIには表示しない）
 if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domains, use_container_width=True):
     if not keyword.strip(): st.error('検索キーワードを入力してください。'); st.stop()
     settings_id = hashlib.sha256(json.dumps({'keyword': keyword, 'mode': mode}, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
@@ -331,14 +367,14 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
             if public_url(candidate, d) and candidate not in seed_map[d]: seed_map[d].append(candidate)
     progress = st.progress(0)
     status = st.empty()
-    details, errors, history = [], [], []
+    details, errors, history, diagnostics = [], [], [], []
     with ThreadPoolExecutor(max_workers=int(workers)) as pool:
         futures = {pool.submit(collect_domain, domain, keyword.strip(), mode, int(max_pages), float(delay), settings_id, seed_map[domain]): domain for domain in domains}
         for idx, future in enumerate(as_completed(futures), start=1):
             domain = futures[future]
             try:
-                d, e, h = future.result()
-                details.extend(d); errors.extend(e); history.append(h)
+                d, e, h, diag = future.result()
+                details.extend(d); errors.extend(e); history.append(h); diagnostics.extend(diag)
             except Exception as exc:
                 errors.append({'ドメイン': domain, 'URL': '', 'エラー': str(exc)})
             progress.progress(idx / len(domains))
@@ -353,8 +389,9 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
         df['サイト名'] = df['ドメイン'].map(name_map).fillna(df['サイト名'])
     summary['検出URL件数'] = summary['検出URL件数'].fillna(0).astype(int)
     edf = pd.DataFrame(errors, columns=['ドメイン','URL','エラー'])
+    diagdf = pd.DataFrame(diagnostics, columns=['ドメイン','取得URL','HTTPステータス','詳細','所要秒'])
     st.session_state['last_result'] = {
-        'df': df, 'history': hdf, 'errors': edf, 'excel': excel_bytes(df, summary, edf, hdf),
+        'df': df, 'history': hdf, 'errors': edf, 'diagnostics': diagdf, 'excel': excel_bytes(df, summary, edf, hdf, diagdf),
         'filename': f'掲載URL収集結果_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
         'detected': len(details), 'error_count': len(errors),
     }
@@ -369,6 +406,8 @@ if 'last_result' in st.session_state:
     st.dataframe(result['df'], hide_index=True, use_container_width=True)
     with st.expander('ドメイン別の確認状況（診断）'):
         st.dataframe(result['history'], hide_index=True, use_container_width=True)
+    with st.expander('取得診断（HTTPステータス・通信エラー）'):
+        st.dataframe(result['diagnostics'], hide_index=True, use_container_width=True)
     if not result['errors'].empty:
         with st.expander('エラー一覧'):
             st.dataframe(result['errors'], hide_index=True, use_container_width=True)
