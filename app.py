@@ -317,7 +317,7 @@ def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_ur
 
 
 st.caption('ドメイン間は並列処理。入力URLを優先し、続いてサイトマップ・サイト内リンクを確認します。')
-workers = 5  # 同時処理ドメイン数（UIには表示しない）
+workers = 3  # 検証用：同時処理ドメイン数を3に固定（UIには表示しない）
 if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domains, use_container_width=True):
     if not keyword.strip(): st.error('検索キーワードを入力してください。'); st.stop()
     settings_id = hashlib.sha256(json.dumps({'keyword': keyword, 'mode': mode}, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
