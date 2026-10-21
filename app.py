@@ -7,7 +7,7 @@ import hashlib
 import ipaddress
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlparse, urldefrag, quote, unquote
 from email.utils import parsedate_to_datetime
 from urllib.robotparser import RobotFileParser
@@ -460,7 +460,7 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
     pagedf = pd.DataFrame(page_diagnostics, columns=['ドメイン','確認URL','最終URL','ページタイトル','抽出本文文字数','本文キーワード一致','HTMLキーワード一致','判定メモ'])
     st.session_state['last_result'] = {
         'df': df, 'history': hdf, 'errors': edf, 'diagnostics': diagdf, 'page_diagnostics': pagedf, 'excel': excel_bytes(df, summary, edf, hdf, diagdf, pagedf),
-        'filename': f'掲載URL収集結果_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
+        'filename': f'掲載URL収集結果_{datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d_%H%M")}.xlsx',
         'detected': len(details), 'error_count': len(errors),
     }
     st.balloons()
