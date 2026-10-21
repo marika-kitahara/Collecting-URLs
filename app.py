@@ -400,6 +400,13 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
 # ダウンロードによる再実行でも結果を消さず、次の収集開始まで保持する。
 if 'last_result' in st.session_state:
     result = st.session_state['last_result']
+    # Streamlit Community Cloud may preserve session_state across code redeploys.
+    # Older results have no diagnostics key; migrate them without crashing.
+    if 'diagnostics' not in result:
+        result['diagnostics'] = pd.DataFrame(columns=['ドメイン','取得URL','HTTPステータス','詳細','所要秒'])
+        st.info('前バージョンの収集結果を表示しています。取得診断を記録するには「収集開始」をもう一度押してください。')
+    if 'errors' not in result:
+        result['errors'] = pd.DataFrame(columns=['ドメイン','URL','エラー'])
     st.success(f"処理終了：今回の検出 {result['detected']} 件 / エラー {result['error_count']} 件")
     st.subheader('検索結果')
     st.caption('※ 入力URLを優先して確認します。検索結果が0件でもサイト全体に掲載がないことは意味しません。')
