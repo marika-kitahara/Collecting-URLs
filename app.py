@@ -9,6 +9,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urldefrag, quote
+from email.utils import parsedate_to_datetime
 from urllib.robotparser import RobotFileParser
 import socket
 import threading
@@ -90,6 +91,13 @@ def safe_get(url, domain, session):
                 log_request(url, r.status_code, 'リダイレクト先が許可範囲外または検証不可', time.monotonic()-start)
                 return None
             r = session.get(target, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False, stream=True)
+        # 一時的なサーバーエラーだけ控えめに再試行。403や429は再試行しない。
+        if r.status_code in (500, 502, 503, 504):
+            first_status = r.status_code
+            r.close()
+            log_request(url, first_status, '一時的なサーバーエラー・再試行待ち', time.monotonic()-start)
+            time.sleep(2)
+            r = session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False, stream=True)
         if r.status_code != 200:
             log_request(url, r.status_code, 'HTTPエラー', time.monotonic()-start)
             r.close()
@@ -184,7 +192,7 @@ def check_page(url, domain, session, robots, keyword, link_patterns):
     if r is None or 'html' not in r.headers.get('Content-Type', '').lower(): return None, []
     soup = BeautifulSoup(r.content, 'html.parser')
     anchors = [(urljoin(r.url, a.get('href', '')), a.get_text(' ', strip=True)) for a in soup.find_all('a', href=True)]
-    links = [href for href, _ in anchors]
+    links = sorted(set(href for href, _ in anchors))  # HTMLのリンク順による探索差を減らす
     # パターン未指定時は「候補」のみ検出。ASPの中継先は検証しない。
     if link_patterns:
         matched_links = [href for href, _ in anchors if any(p.casefold() in href.casefold() for p in link_patterns)]
@@ -294,6 +302,8 @@ def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_ur
     site_name = ''
     now = datetime.now(timezone.utc).isoformat(timespec='seconds')
     visited, checked, succeeded = set(), 0, 0
+    skipped_robots = 0
+    selected_urls = []
     session = requests.Session()  # ワーカー間でSessionを共有しない
     try:
         base = 'https://' + domain
@@ -317,8 +327,13 @@ def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_ur
         last_request_at = 0.0
         while frontier and checked < max_pages:
             url = frontier.pop(0)
-            if url in visited or not allowed(url, robots): continue
+            if url in visited: continue
+            if not allowed(url, robots):
+                skipped_robots += 1
+                log_request(url, '巡回禁止', 'robots.txtのルールにより確認対象外')
+                continue
             visited.add(url)
+            selected_urls.append(url)
             # 同一ドメインのページ確認間隔。異なるドメインは並列に進む。
             remaining = actual_delay - (time.monotonic() - last_request_at)
             if remaining > 0: time.sleep(remaining)
@@ -339,14 +354,24 @@ def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_ur
                                     '一致したリンク': page['matched_links'], '確認日時UTC': now,
                                     '設定ID': settings_id})
                 for link in links: add(link)
-        state = '完了' if checked else '確認ページなし'
+        failures = [x for x in _diag_local.records if x['HTTPステータス'] in ('通信エラー','タイムアウト','URL検証不可') or (isinstance(x['HTTPステータス'], int) and x['HTTPステータス'] >= 400)]
+        if checked == 0:
+            state = '巡回制限・未確認' if skipped_robots else '確認ページなし'
+        elif succeeded == 0:
+            state = '取得失敗・未確認'
+        elif failures or succeeded < checked:
+            state = '一部取得失敗'
+        elif frontier and checked >= max_pages:
+            state = '確認上限到達'
+        else:
+            state = '確認完了（確認範囲内）'
     except Exception as exc:
         errors.append({'ドメイン': domain, 'URL': '', 'エラー': str(exc)})
-        state = '失敗'
+        state = '巡回制限・未確認' if 'robots.txt' in str(exc) else '取得失敗・未確認'
     finally:
         session.close()
     history = {'サイト名': site_name, 'ドメイン': domain, '設定ID': settings_id, '状態': state,
-               '確認ページ数': checked, '取得成功ページ数': succeeded, '候補URL数': len(locals().get('frontier', [])) + len(visited), '検出URL数': len(details), '確認日時UTC': now}
+               '確認ページ数': checked, '取得成功ページ数': succeeded, '候補URL数': len(locals().get('frontier', [])) + len(visited), '検出URL数': len(details), '確認日時UTC': now, '確認対象URL': ' | '.join(selected_urls)[:30000], 'robots除外数': skipped_robots}
     records = _diag_local.records
     _diag_local.records = None
     return details, errors, history, records
@@ -380,7 +405,7 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
             progress.progress(idx / len(domains))
             status.write(f'完了 {idx}/{len(domains)} ドメイン（直近: {domain}）')
     df = pd.DataFrame(details, columns=['サイト名','ドメイン','URL','タイトル','商品名掲載','送客リンク掲載','一致したリンク','確認日時UTC','設定ID'])
-    hdf = pd.DataFrame(history, columns=['サイト名','ドメイン','設定ID','状態','確認ページ数','取得成功ページ数','候補URL数','検出URL数','確認日時UTC'])
+    hdf = pd.DataFrame(history, columns=['サイト名','ドメイン','設定ID','状態','確認ページ数','取得成功ページ数','候補URL数','検出URL数','確認日時UTC','確認対象URL','robots除外数'])
     summary = pd.DataFrame({'ドメイン': domains}).merge(df.groupby('ドメイン').size().rename('検出URL件数').reset_index(), how='left', on='ドメイン')
     name_map = dict(zip(hdf['ドメイン'], hdf['サイト名']))
     st.session_state['site_names'] = name_map
@@ -388,6 +413,7 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
     if not df.empty:
         df['サイト名'] = df['ドメイン'].map(name_map).fillna(df['サイト名'])
     summary['検出URL件数'] = summary['検出URL件数'].fillna(0).astype(int)
+    summary = summary.merge(hdf[['ドメイン','状態','確認ページ数','取得成功ページ数']], on='ドメイン', how='left')
     edf = pd.DataFrame(errors, columns=['ドメイン','URL','エラー'])
     diagdf = pd.DataFrame(diagnostics, columns=['ドメイン','取得URL','HTTPステータス','詳細','所要秒'])
     st.session_state['last_result'] = {
@@ -409,7 +435,7 @@ if 'last_result' in st.session_state:
         result['errors'] = pd.DataFrame(columns=['ドメイン','URL','エラー'])
     st.success(f"処理終了：今回の検出 {result['detected']} 件 / エラー {result['error_count']} 件")
     st.subheader('検索結果')
-    st.caption('※ 入力URLを優先して確認します。検索結果が0件でもサイト全体に掲載がないことは意味しません。')
+    st.caption('※ 入力URLを優先して確認します。検出0件は掲載なしを意味しません。巡回制限・取得失敗・確認上限を診断欄で区別します。')
     st.dataframe(result['df'], hide_index=True, use_container_width=True)
     with st.expander('ドメイン別の確認状況（診断）'):
         st.dataframe(result['history'], hide_index=True, use_container_width=True)
