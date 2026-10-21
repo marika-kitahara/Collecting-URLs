@@ -222,10 +222,10 @@ def read_urls(upload):
     return pd.read_excel(upload, dtype=str)
 
 
-def excel_bytes(details, summary, errors, history, diagnostics):
+def excel_bytes(details, summary, errors, history, diagnostics, candidates):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine='openpyxl') as writer:
-        for name, frame in [('掲載URL一覧', details), ('ドメイン別集計', summary), ('エラー一覧', errors), ('検索履歴', history), ('取得診断', diagnostics)]:
+        for name, frame in [('掲載URL一覧', details), ('ドメイン別集計', summary), ('エラー一覧', errors), ('検索履歴', history), ('取得診断', diagnostics), ('公開インデックス候補', candidates)]:
             frame.to_excel(writer, sheet_name=name, index=False)
             ws = writer.sheets[name]
             ws.freeze_panes = 'A2'
@@ -244,7 +244,7 @@ st.markdown('''<style>
 .stButton > button[kind="primary"] {background: linear-gradient(105deg,#2563eb,#7c3aed); color:white; border:0; border-radius:14px; min-height:3.4rem; font-size:1.08rem; font-weight:750; box-shadow:0 5px 15px rgba(67,56,202,.22);}
 .stButton > button[kind="primary"]:hover {background:linear-gradient(105deg,#1d4ed8,#6d28d9); color:white; transform:translateY(-1px);}
 </style>''', unsafe_allow_html=True)
-st.caption('サイトマップ・サイト内リンクから候補を集め、ページ本文とリンクを検査します。検索APIは使用しません。網羅性は保証されません。')
+st.caption('サイトマップ・サイト内リンクを検査。検出0件のドメインではCommon Crawl公開インデックスから過去のURL候補も探します（掲載確認ではありません）。')
 st.subheader('URL一覧の入力')
 input_method = st.radio('入力方法', ['ファイルをアップロード', 'テキストを直接貼り付け'], horizontal=True)
 file = None
@@ -295,8 +295,63 @@ if raw_urls:
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                        on_click='ignore')
 
+# Common Crawl is a historical URL index, NOT a live content or keyword search.
+# Only URLs are discovered here. Never infer product presence from index records.
+CC_INFO = 'https://index.commoncrawl.org/collinfo.json'
+CC_LIMIT = 30
+
+def common_crawl_candidates(domain, seed_urls, diagnostic):
+    candidates = []
+    seen = set()
+    def record(status, detail, url=''):
+        diagnostic.append({'ドメイン': domain, '取得URL': url or CC_INFO,
+                           'HTTPステータス': status, '詳細': detail[:300], '所要秒': 0})
+    try:
+        info = requests.get(CC_INFO, headers=HEADERS, timeout=8)
+        info.raise_for_status()
+        indexes = info.json()
+        if not isinstance(indexes, list) or not indexes:
+            record('CC未取得', '公開インデックス一覧が空'); return candidates
+        index_api = indexes[0].get('cdx-api')
+        if not isinstance(index_api, str) or not index_api.startswith('https://index.commoncrawl.org/'):
+            record('CC未取得', 'インデックスURLが不正'); return candidates
+        # A bounded sample, not an exhaustive search. Query exact host and subdomains.
+        for pattern in (domain + '/*', '*.' + domain + '/*'):
+            if len(candidates) >= CC_LIMIT: break
+            try:
+                response = requests.get(index_api, params={'url': pattern, 'output': 'json',
+                    'filter': 'status:200', 'collapse': 'urlkey', 'pageSize': '1'},
+                    headers=HEADERS, timeout=14, stream=True)
+                if response.status_code in (404, 403, 429):
+                    record(response.status_code, 'Common Crawl候補取得不可', response.url)
+                    response.close(); continue
+                response.raise_for_status()
+                consumed = 0
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line: continue
+                    consumed += len(line)
+                    if consumed > 400_000 or len(candidates) >= CC_LIMIT: break
+                    try:
+                        item = json.loads(line)
+                        url = item.get('url', '')
+                        if not isinstance(url, str) or not in_scope(host_of(url), domain): continue
+                        parsed = urlparse(url)
+                        if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password: continue
+                        url = urldefrag(url)[0]
+                        if url not in seen:
+                            seen.add(url); candidates.append(url)
+                    except (ValueError, TypeError): continue
+                record('CC成功', f'公開インデックスのURL候補 {len(candidates)} 件（本文未確認）', response.url)
+                response.close()
+            except requests.RequestException as exc:
+                record('CC通信エラー', type(exc).__name__ + ': ' + str(exc), index_api)
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        record('CC通信エラー', type(exc).__name__ + ': ' + str(exc))
+    return candidates
+
+
 def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_urls):
-    details, errors = [], []
+    details, errors, cc_candidates = [], [], []
     _diag_local.records = []
     _diag_local.domain = domain
     site_name = ''
@@ -370,11 +425,18 @@ def collect_domain(domain, keyword, mode, max_pages, delay, settings_id, seed_ur
         state = '巡回制限・未確認' if 'robots.txt' in str(exc) else '取得失敗・未確認'
     finally:
         session.close()
+    # Search historical public index only when ordinary crawling found nothing.
+    # This is not a robots bypass: discovered URLs are NOT fetched when crawling is restricted.
+    if not details:
+        cc_candidates = common_crawl_candidates(domain, seed_urls, _diag_local.records)
+    cc_rows = [{'ドメイン': domain, '候補URL': url, '情報源': 'Common Crawl公開インデックス',
+                '掲載判定': '本文未確認・掲載不明', '備考': '過去の収録URL。キーワード掲載の証拠ではありません'}
+               for url in cc_candidates]
     history = {'サイト名': site_name, 'ドメイン': domain, '設定ID': settings_id, '状態': state,
-               '確認ページ数': checked, '取得成功ページ数': succeeded, '候補URL数': len(locals().get('frontier', [])) + len(visited), '検出URL数': len(details), '確認日時UTC': now, '確認対象URL': ' | '.join(selected_urls)[:30000], 'robots除外数': skipped_robots}
+               '確認ページ数': checked, '取得成功ページ数': succeeded, '候補URL数': len(locals().get('frontier', [])) + len(visited), '検出URL数': len(details), '確認日時UTC': now, '確認対象URL': ' | '.join(selected_urls)[:30000], 'robots除外数': skipped_robots, '公開インデックス候補数': len(cc_rows)}
     records = _diag_local.records
     _diag_local.records = None
-    return details, errors, history, records
+    return details, errors, history, records, cc_rows
 
 
 st.caption('ドメイン間は並列処理。入力URLを優先し、続いてサイトマップ・サイト内リンクを確認します。')
@@ -392,20 +454,20 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
             if public_url(candidate, d) and candidate not in seed_map[d]: seed_map[d].append(candidate)
     progress = st.progress(0)
     status = st.empty()
-    details, errors, history, diagnostics = [], [], [], []
+    details, errors, history, diagnostics, cc_candidates = [], [], [], [], []
     with ThreadPoolExecutor(max_workers=int(workers)) as pool:
         futures = {pool.submit(collect_domain, domain, keyword.strip(), mode, int(max_pages), float(delay), settings_id, seed_map[domain]): domain for domain in domains}
         for idx, future in enumerate(as_completed(futures), start=1):
             domain = futures[future]
             try:
-                d, e, h, diag = future.result()
-                details.extend(d); errors.extend(e); history.append(h); diagnostics.extend(diag)
+                d, e, h, diag, cc = future.result()
+                details.extend(d); errors.extend(e); history.append(h); diagnostics.extend(diag); cc_candidates.extend(cc)
             except Exception as exc:
                 errors.append({'ドメイン': domain, 'URL': '', 'エラー': str(exc)})
             progress.progress(idx / len(domains))
             status.write(f'完了 {idx}/{len(domains)} ドメイン（直近: {domain}）')
     df = pd.DataFrame(details, columns=['サイト名','ドメイン','URL','タイトル','商品名掲載','送客リンク掲載','一致したリンク','確認日時UTC','設定ID'])
-    hdf = pd.DataFrame(history, columns=['サイト名','ドメイン','設定ID','状態','確認ページ数','取得成功ページ数','候補URL数','検出URL数','確認日時UTC','確認対象URL','robots除外数'])
+    hdf = pd.DataFrame(history, columns=['サイト名','ドメイン','設定ID','状態','確認ページ数','取得成功ページ数','候補URL数','検出URL数','確認日時UTC','確認対象URL','robots除外数','公開インデックス候補数'])
     summary = pd.DataFrame({'ドメイン': domains}).merge(df.groupby('ドメイン').size().rename('検出URL件数').reset_index(), how='left', on='ドメイン')
     name_map = dict(zip(hdf['ドメイン'], hdf['サイト名']))
     st.session_state['site_names'] = name_map
@@ -413,11 +475,12 @@ if st.button('🚀 掲載URLを収集する', type='primary', disabled=not domai
     if not df.empty:
         df['サイト名'] = df['ドメイン'].map(name_map).fillna(df['サイト名'])
     summary['検出URL件数'] = summary['検出URL件数'].fillna(0).astype(int)
-    summary = summary.merge(hdf[['ドメイン','状態','確認ページ数','取得成功ページ数']], on='ドメイン', how='left')
+    summary = summary.merge(hdf[['ドメイン','状態','確認ページ数','取得成功ページ数','公開インデックス候補数']], on='ドメイン', how='left')
     edf = pd.DataFrame(errors, columns=['ドメイン','URL','エラー'])
     diagdf = pd.DataFrame(diagnostics, columns=['ドメイン','取得URL','HTTPステータス','詳細','所要秒'])
+    ccdf = pd.DataFrame(cc_candidates, columns=['ドメイン','候補URL','情報源','掲載判定','備考'])
     st.session_state['last_result'] = {
-        'df': df, 'history': hdf, 'errors': edf, 'diagnostics': diagdf, 'excel': excel_bytes(df, summary, edf, hdf, diagdf),
+        'df': df, 'history': hdf, 'errors': edf, 'diagnostics': diagdf, 'cc_candidates': ccdf, 'excel': excel_bytes(df, summary, edf, hdf, diagdf, ccdf),
         'filename': f'掲載URL収集結果_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
         'detected': len(details), 'error_count': len(errors),
     }
@@ -431,6 +494,8 @@ if 'last_result' in st.session_state:
     if 'diagnostics' not in result:
         result['diagnostics'] = pd.DataFrame(columns=['ドメイン','取得URL','HTTPステータス','詳細','所要秒'])
         st.info('前バージョンの収集結果を表示しています。取得診断を記録するには「収集開始」をもう一度押してください。')
+    if 'cc_candidates' not in result:
+        result['cc_candidates'] = pd.DataFrame(columns=['ドメイン','候補URL','情報源','掲載判定','備考'])
     if 'errors' not in result:
         result['errors'] = pd.DataFrame(columns=['ドメイン','URL','エラー'])
     st.success(f"処理終了：今回の検出 {result['detected']} 件 / エラー {result['error_count']} 件")
@@ -441,6 +506,9 @@ if 'last_result' in st.session_state:
         st.dataframe(result['history'], hide_index=True, use_container_width=True)
     with st.expander('取得診断（HTTPステータス・通信エラー）'):
         st.dataframe(result['diagnostics'], hide_index=True, use_container_width=True)
+    with st.expander('公開インデックス候補（本文未確認・掲載不明）', expanded=not result['cc_candidates'].empty):
+        st.caption('過去に収録されたURLの候補です。商品名の掲載や現在のページ存在を示しません。')
+        st.dataframe(result['cc_candidates'], hide_index=True, use_container_width=True)
     if not result['errors'].empty:
         with st.expander('エラー一覧'):
             st.dataframe(result['errors'], hide_index=True, use_container_width=True)
